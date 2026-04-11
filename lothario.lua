@@ -8,6 +8,16 @@ musicutil = require 'musicutil'
 -- use our custom engine
 engine.name = 'Lothario'
 
+local K2_LONG_PRESS_TIME = 0.75
+local BUFFER_PURGE_TIME = 30
+
+local k2_down = false
+local k2_long_press_clock = nil
+local k2_long_press_triggered = false
+local purge_active = false
+local purge_end_time = nil
+local purge_notice_until = nil
+
 ------------------------------
 -- init
 ------------------------------
@@ -20,6 +30,54 @@ function init()
     redraw()
   end, 1/15, -1)
   redrawtimer:start()
+end
+
+local function toggle_input_passthrough()
+  if inpass then
+    inpass = false
+    params:set('monitor_level', -inf)
+  else
+    inpass = true
+    params:set('monitor_level', remember)
+  end
+end
+
+local function toggle_delay_input()
+  if delin then
+    delin = false
+    params:set('delay_input_onoff', 1)
+  else
+    delin = true
+    params:set('delay_input_onoff', 2)
+  end
+end
+
+local function toggle_delay_output()
+  if delout then
+    delout = false
+    params:set('delay_output_onoff', 1)
+  else
+    delout = true
+    params:set('delay_output_onoff', 2)
+  end
+end
+
+local function begin_buffer_purge()
+  if purge_active then
+    return
+  end
+
+  purge_active = true
+  purge_end_time = util.time() + BUFFER_PURGE_TIME
+  purge_notice_until = nil
+  osc.send({'localhost', 57120}, '/receiver', {21, BUFFER_PURGE_TIME})
+
+  clock.run(function()
+    clock.sleep(BUFFER_PURGE_TIME)
+    purge_active = false
+    purge_end_time = nil
+    purge_notice_until = util.time() + 2
+  end)
 end
 
 --------------------------
@@ -37,33 +95,42 @@ function enc(n, d)
 end
 
 function key(n, z)
+  if n == 2 then
+    if purge_active then
+      return
+    end
+    if z == 1 then
+      k2_down = true
+      k2_long_press_triggered = false
+      if k2_long_press_clock ~= nil then
+        clock.cancel(k2_long_press_clock)
+      end
+      k2_long_press_clock = clock.run(function()
+        clock.sleep(K2_LONG_PRESS_TIME)
+        if k2_down and not purge_active then
+          k2_long_press_triggered = true
+          begin_buffer_purge()
+        end
+      end)
+    else
+      k2_down = false
+      if k2_long_press_clock ~= nil then
+        clock.cancel(k2_long_press_clock)
+        k2_long_press_clock = nil
+      end
+      if not k2_long_press_triggered then
+        toggle_delay_input()
+      end
+    end
+    return
+  end
+
   if z == 1 then
     if n == 1 then
-      if inpass then
-        inpass = false
-        params:set('monitor_level', -inf)
-      else
-        inpass = true
-        params:set('monitor_level', remember)
-      end
-    end
-    if n == 2 then
-      if delin then
-        delin = false
-        params:set('delay_input_onoff', 1)
-      else
-        delin = true
-        params:set('delay_input_onoff', 2)
-      end
+      toggle_input_passthrough()
     end
     if n == 3 then
-      if delout then
-        delout = false
-        params:set('delay_output_onoff', 1)
-      else
-        delout = true
-        params:set('delay_output_onoff', 2)
-      end
+      toggle_delay_output()
     end
   end
 end
@@ -103,7 +170,7 @@ function add_parameters()
       delout = true
     end
   end)
-  params:add_group('delay levels', 3)
+  params:add_group('delay levels', 5)
   params:add_control('input_passthrough', 'input passthru level', controlspec.DB)
   params:set_action('input_passthrough', function(value)
     params:set('monitor_level', value)
@@ -118,6 +185,14 @@ function add_parameters()
   params:add_control('pre_level', 'preserve level', controlspec.AMP)
   params:set_action('pre_level', function(value)
     osc.send({'localhost', 57120}, '/receiver', {4, value})
+  end)
+  params:add_control('grain_decay_time', 'grain decay time', controlspec.new(10, 600, 'lin', 1, 120, 's'))
+  params:set_action('grain_decay_time', function(value)
+    osc.send({'localhost', 57120}, '/receiver', {20, value})
+  end)
+  params:add_option('outputs', 'outputs', {'all', '1-2', '3-4'}, 1)
+  params:set_action('outputs', function(value)
+    osc.send({'localhost', 57120}, '/receiver', {22, value})
   end)
   params:add_group('feedback', 6)
   params:add_control('fb_level', 'feedback level', controlspec.AMP)
@@ -152,6 +227,8 @@ function add_parameters()
     osc.send({'localhost', 57120}, '/receiver', {11, value / 100})
   end)
   params:set('fx_probability', 50)
+  params:set('grain_decay_time', 120)
+  params:set('outputs', 1)
 
   -- effect range configuration
   -- group them together for clarity
@@ -227,12 +304,19 @@ function redraw()
     screen.level(5)
   end
   screen.text('delay output')
-  -- draw FX probability
-  screen.move(1, 70)
+  screen.move(1, 63)
   screen.level(15)
-  screen.text('fx prob')
-  screen.move(75, 70)
-  screen.text(params:get('fx_probability'))
+  if purge_active and purge_end_time ~= nil then
+    screen.text('clearing')
+    screen.move(75, 63)
+    screen.text(math.ceil(math.max(0, purge_end_time - util.time())) .. 's')
+  elseif purge_notice_until ~= nil and util.time() < purge_notice_until then
+    screen.text('buffer ready')
+  else
+    screen.text('fx prob')
+    screen.move(75, 63)
+    screen.text(params:get('fx_probability'))
+  end
   screen.update()
 end
 

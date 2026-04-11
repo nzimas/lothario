@@ -9,6 +9,11 @@ Engine_Lothario : CroneEngine {
     var ringMin, ringMax;
     var rateMin, rateMax;
     var bitMin, bitMax;
+    var grainDecayTime;
+    var inputAmp, preLevelValue, grainUserAmp;
+    var flushRoutine;
+    var flushActive;
+    var outputMode;
 
     *new { arg context, doneCallback;
         ^super.new(context, doneCallback);
@@ -39,10 +44,12 @@ Engine_Lothario : CroneEngine {
         }).add;
 
         SynthDef(\rec, {
-            arg ptrIn = 0, micIn = 0, buf = 0, preLevel = 0;
+            arg ptrIn = 0, micIn = 0, buf = 0, preLevel = 0, decayTime = 120;
             var ptr = In.ar(ptrIn, 1);
             var sig = In.ar(micIn, 1);
-            sig = sig + (BufRd.ar(1, buf, ptr) * preLevel);
+            var cycleDur = BufFrames.kr(buf) / BufSampleRate.kr(buf);
+            var retain = (1 - (cycleDur / decayTime.max(0.001))).clip(0, 1);
+            sig = sig + (BufRd.ar(1, buf, ptr) * preLevel * retain);
             BufWr.ar(sig, buf, ptr);
         }).add;
 
@@ -72,7 +79,10 @@ Engine_Lothario : CroneEngine {
                 pitchMin = 0.5, pitchMax = 2.0,
                 ringMin = 100.0, ringMax = 2000.0,
                 rateMin = 1000.0, rateMax = 22050.0,
-                bitMin = 4.0, bitMax = 16.0;
+                bitMin = 4.0, bitMax = 16.0,
+                grainDecayTime = 120,
+                outputMode = 1,
+                fadeLevel = 1, fadeLag = 0.05;
 
             var env, densCtrl, durCtrl, rateCtrl, panCtrl;
             var ptr, ptrRand, totalDelay, maxGrainDur;
@@ -84,6 +94,7 @@ Engine_Lothario : CroneEngine {
             var pitched, ringed, sampleReduced, bitReduced, fxSig;
             var ampSig;
             var monoSig, chanIdx, mask, outSig;
+            var sourceAge, ageFade, fadeMul;
 
             env = EnvGen.kr(Env.asr(atk, 1, rel), gate, doneAction: 2);
 
@@ -98,6 +109,9 @@ Engine_Lothario : CroneEngine {
             ptr = In.ar(ptrBus, 1);
             ptr = ptr - totalDelay;
             ptr = ptr / BufFrames.kr(buf);
+            sourceAge = totalDelay / SampleRate.ir;
+            ageFade = (1 - (sourceAge / grainDecayTime.max(0.001))).clip(0, 1);
+            fadeMul = Lag.kr(fadeLevel, fadeLag);
 
             maxGrainDur = (totalDelay / rateCtrl) / SampleRate.ir;
             durCtrl = min(durCtrl, maxGrainDur);
@@ -131,11 +145,15 @@ Engine_Lothario : CroneEngine {
             applyFx = ((randomProba <= fxProb) & (ampSig > 0.0001)).asInteger;
 
             sigProcessed = Select.ar(applyFx, [sigRaw, fxSig]);
-            sigProcessed = MoogFF.ar(sigProcessed * env * amp, freq: cutoff, gain: resonance);
+            sigProcessed = MoogFF.ar(sigProcessed * env * amp * ageFade * fadeMul, freq: cutoff, gain: resonance);
 
             monoSig = (sigProcessed[0] + sigProcessed[1]) * 0.5;
 
-            chanIdx = TIRand.kr(0, 3, grainTrig);
+            chanIdx = Select.kr(outputMode - 1, [
+                TIRand.kr(0, 3, grainTrig),
+                TIRand.kr(0, 1, grainTrig),
+                TIRand.kr(2, 3, grainTrig)
+            ]);
             mask = Select.kr(chanIdx, [
                 [1, 0, 0, 0],
                 [0, 1, 0, 0],
@@ -179,6 +197,13 @@ Engine_Lothario : CroneEngine {
         ringMin = 100.0; ringMax = 2000.0;
         rateMin = 1000.0; rateMax = 22050.0;
         bitMin = 4.0; bitMax = 16.0;
+        grainDecayTime = 120.0;
+        inputAmp = 0.5;
+        preLevelValue = 0.0;
+        grainUserAmp = 0.0;
+        flushRoutine = nil;
+        flushActive = false;
+        outputMode = 1;
 
         g = 16.collect({ arg n;
             Synth(\gran, [
@@ -207,23 +232,30 @@ Engine_Lothario : CroneEngine {
                 \pitchMin, pitchMin, \pitchMax, pitchMax,
                 \ringMin, ringMin, \ringMax, ringMax,
                 \rateMin, rateMin, \rateMax, rateMax,
-                \bitMin, bitMin, \bitMax, bitMax
+                \bitMin, bitMin, \bitMax, bitMax,
+                \grainDecayTime, grainDecayTime,
+                \outputMode, outputMode,
+                \fadeLevel, 1,
+                \fadeLag, 0.05
             ], granGrp);
         });
 
         oscs.put("receiver",
             OSCFunc.new({ |msg, time, addr, recvPort|
-                if(msg[1] == 2, { a.set(\amp, msg[2]); });
-
-                if(msg[1] == 3, {
-                    if(msg[2] == 1, {
-                        16.do({ arg j; g[j].set(\amp, 0); });
-                    }, {
-                        16.do({ arg j; g[j].set(\amp, msg[2]); });
-                    });
+                if(msg[1] == 2, {
+                    inputAmp = msg[2];
+                    if(flushActive.not, { a.set(\amp, inputAmp); });
                 });
 
-                if(msg[1] == 4, { i.set(\preLevel, msg[2]); });
+                if(msg[1] == 3, {
+                    grainUserAmp = if(msg[2] == 1, { 0 }, { msg[2] });
+                    16.do({ arg j; g[j].set(\amp, grainUserAmp); });
+                });
+
+                if(msg[1] == 4, {
+                    preLevelValue = msg[2];
+                    if(flushActive.not, { i.set(\preLevel, preLevelValue); });
+                });
 
                 if(msg[1] == 5, { fb.set(\amp, msg[2]); });
                 if(msg[1] == 6, { fb.set(\balance, msg[2]); });
@@ -276,6 +308,34 @@ Engine_Lothario : CroneEngine {
                     bitMax = msg[2];
                     16.do({ arg j; g[j].set(\bitMax, bitMax); });
                 });
+
+                if(msg[1] == 20, {
+                    grainDecayTime = msg[2];
+                    i.set(\decayTime, grainDecayTime);
+                    16.do({ arg j; g[j].set(\grainDecayTime, grainDecayTime); });
+                });
+
+                if(msg[1] == 21, {
+                    if(flushRoutine.notNil, { flushRoutine.stop; });
+                    flushActive = true;
+                    a.set(\amp, 0);
+                    i.set(\preLevel, 0);
+                    16.do({ arg j; g[j].set(\fadeLag, 30, \fadeLevel, 0); });
+                    flushRoutine = Routine({
+                        30.wait;
+                        if(b.notNil, { b.zero; });
+                        i.set(\preLevel, preLevelValue, \decayTime, grainDecayTime);
+                        a.set(\amp, inputAmp);
+                        16.do({ arg j; g[j].set(\fadeLag, 0.05, \fadeLevel, 1, \amp, grainUserAmp, \grainDecayTime, grainDecayTime); });
+                        flushActive = false;
+                        flushRoutine = nil;
+                    }).play(SystemClock);
+                });
+
+                if(msg[1] == 22, {
+                    outputMode = msg[2];
+                    16.do({ arg j; g[j].set(\outputMode, outputMode); });
+                });
             }, "/receiver");
         );
     }
@@ -285,6 +345,7 @@ Engine_Lothario : CroneEngine {
         if(timer.notNil, { timer.free; });
         if(micBus.notNil, { micBus.free; });
         if(ptrBus.notNil, { ptrBus.free; });
+        if(flushRoutine.notNil, { flushRoutine.stop; });
 
         if(micGrp.notNil, { micGrp.free; });
         if(ptrGrp.notNil, { ptrGrp.free; });
