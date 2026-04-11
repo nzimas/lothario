@@ -93,7 +93,7 @@ Engine_Lothario : CroneEngine {
             var pitchRatio, ringFreq, sampleRateRed, bitDepth;
             var pitched, ringed, sampleReduced, bitReduced, fxSig;
             var ampSig;
-            var monoSig, chanIdx, mask, outSig;
+            var monoSig, chanIdx, baseMask, outputMask, mask, outSig;
             var sourceAge, ageFade, fadeMul;
 
             env = EnvGen.kr(Env.asr(atk, 1, rel), gate, doneAction: 2);
@@ -149,17 +149,19 @@ Engine_Lothario : CroneEngine {
 
             monoSig = (sigProcessed[0] + sigProcessed[1]) * 0.5;
 
-            chanIdx = Select.kr(outputMode - 1, [
-                TIRand.kr(0, 3, grainTrig),
-                TIRand.kr(0, 1, grainTrig),
-                TIRand.kr(2, 3, grainTrig)
-            ]);
-            mask = Select.kr(chanIdx, [
+            chanIdx = TIRand.kr(0, 3, grainTrig);
+            baseMask = Select.kr(chanIdx, [
                 [1, 0, 0, 0],
                 [0, 1, 0, 0],
                 [0, 0, 1, 0],
                 [0, 0, 0, 1]
             ]);
+            outputMask = Select.kr(outputMode - 1, [
+                [1, 1, 1, 1],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1]
+            ]);
+            mask = baseMask * outputMask;
             mask = Lag.kr(mask, 0.005);
 
             outSig = monoSig * mask;
