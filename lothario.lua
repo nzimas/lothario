@@ -10,13 +10,24 @@ engine.name = 'Lothario'
 
 local K2_LONG_PRESS_TIME = 0.75
 local BUFFER_PURGE_TIME = 30
+local K3_SCAN_HOLD_TIME = 0.2
 
 local k2_down = false
 local k2_long_press_clock = nil
 local k2_long_press_triggered = false
+local k3_down = false
+local k3_hold_clock = nil
+local k3_hold_triggered = false
 local purge_active = false
 local purge_end_time = nil
 local purge_notice_until = nil
+local speaker_scan_active = false
+local speaker_scan_clock = nil
+local current_scan_speaker = 1
+local scan_step_index = 0
+local scan_ping_pong_direction = 1
+local scan_drunk_direction = 1
+local scan_shuffle_bag = {}
 
 ------------------------------
 -- init
@@ -32,14 +43,41 @@ function init()
   redrawtimer:start()
 end
 
+local function db_to_amp(db)
+  if db == nil or db <= -60 then
+    return 0
+  end
+  return math.pow(10, db / 20)
+end
+
+local function current_monitor_amp()
+  if not inpass then
+    return 0
+  end
+  return db_to_amp(params:get('input_passthrough'))
+end
+
+local function refresh_monitor_routing()
+  if speaker_scan_active then
+    params:set('monitor_level', -inf)
+    osc.send({'localhost', 57120}, '/receiver', {25, current_monitor_amp()})
+  else
+    osc.send({'localhost', 57120}, '/receiver', {25, 0})
+    if inpass then
+      params:set('monitor_level', remember)
+    else
+      params:set('monitor_level', -inf)
+    end
+  end
+end
+
 local function toggle_input_passthrough()
   if inpass then
     inpass = false
-    params:set('monitor_level', -inf)
   else
     inpass = true
-    params:set('monitor_level', remember)
   end
+  refresh_monitor_routing()
 end
 
 local function toggle_delay_input()
@@ -62,11 +100,110 @@ local function toggle_delay_output()
   end
 end
 
+local function next_shuffle_speaker()
+  if #scan_shuffle_bag == 0 then
+    scan_shuffle_bag = {1, 2, 3, 4}
+    for i = #scan_shuffle_bag, 2, -1 do
+      local j = math.random(i)
+      scan_shuffle_bag[i], scan_shuffle_bag[j] = scan_shuffle_bag[j], scan_shuffle_bag[i]
+    end
+  end
+
+  return table.remove(scan_shuffle_bag, 1)
+end
+
+local function step_scan_speaker(initial)
+  local scan_type = params:string('speaker_scan_type')
+
+  if scan_type == 'random' then
+    current_scan_speaker = math.random(4)
+  elseif scan_type == 'circular' then
+    scan_step_index = (scan_step_index % 4) + 1
+    current_scan_speaker = scan_step_index
+  elseif scan_type == 'ping-pong' then
+    if initial then
+      current_scan_speaker = 1
+      scan_ping_pong_direction = 1
+    else
+      current_scan_speaker = current_scan_speaker + scan_ping_pong_direction
+      if current_scan_speaker >= 4 then
+        current_scan_speaker = 4
+        scan_ping_pong_direction = -1
+      elseif current_scan_speaker <= 1 then
+        current_scan_speaker = 1
+        scan_ping_pong_direction = 1
+      end
+    end
+  elseif scan_type == 'shuffle' then
+    current_scan_speaker = next_shuffle_speaker()
+  else
+    if initial then
+      current_scan_speaker = math.random(4)
+      scan_drunk_direction = (math.random(2) == 1) and -1 or 1
+    else
+      if math.random() < 0.35 then
+        scan_drunk_direction = -scan_drunk_direction
+      end
+      current_scan_speaker = current_scan_speaker + scan_drunk_direction
+      if current_scan_speaker >= 4 then
+        current_scan_speaker = 4
+        scan_drunk_direction = -1
+      elseif current_scan_speaker <= 1 then
+        current_scan_speaker = 1
+        scan_drunk_direction = 1
+      end
+    end
+  end
+
+  osc.send({'localhost', 57120}, '/receiver', {24, current_scan_speaker})
+end
+
+local function stop_speaker_scan()
+  if not speaker_scan_active then
+    return
+  end
+
+  speaker_scan_active = false
+  if speaker_scan_clock ~= nil then
+    clock.cancel(speaker_scan_clock)
+    speaker_scan_clock = nil
+  end
+
+  osc.send({'localhost', 57120}, '/receiver', {23, 0})
+  osc.send({'localhost', 57120}, '/receiver', {24, 1})
+  refresh_monitor_routing()
+end
+
+local function start_speaker_scan()
+  if speaker_scan_active or purge_active then
+    return
+  end
+
+  speaker_scan_active = true
+  scan_step_index = 0
+  scan_ping_pong_direction = 1
+  scan_drunk_direction = (math.random(2) == 1) and -1 or 1
+  scan_shuffle_bag = {}
+  osc.send({'localhost', 57120}, '/receiver', {23, 1})
+  refresh_monitor_routing()
+
+  speaker_scan_clock = clock.run(function()
+    step_scan_speaker(true)
+    while speaker_scan_active do
+      clock.sleep(params:get('speaker_scan_rate') / 1000)
+      if speaker_scan_active then
+        step_scan_speaker(false)
+      end
+    end
+  end)
+end
+
 local function begin_buffer_purge()
   if purge_active then
     return
   end
 
+  stop_speaker_scan()
   purge_active = true
   purge_end_time = util.time() + BUFFER_PURGE_TIME
   purge_notice_until = nil
@@ -125,13 +262,40 @@ function key(n, z)
     return
   end
 
-  if z == 1 then
-    if n == 1 then
+  if n == 3 then
+    if purge_active then
+      return
+    end
+    if z == 1 then
+      k3_down = true
+      k3_hold_triggered = false
+      if k3_hold_clock ~= nil then
+        clock.cancel(k3_hold_clock)
+      end
+      k3_hold_clock = clock.run(function()
+        clock.sleep(K3_SCAN_HOLD_TIME)
+        if k3_down and not purge_active then
+          k3_hold_triggered = true
+          start_speaker_scan()
+        end
+      end)
+    else
+      k3_down = false
+      if k3_hold_clock ~= nil then
+        clock.cancel(k3_hold_clock)
+        k3_hold_clock = nil
+      end
+      if k3_hold_triggered then
+        stop_speaker_scan()
+      else
+        toggle_delay_output()
+      end
+    end
+    return
+  end
+
+  if z == 1 and n == 1 then
       toggle_input_passthrough()
-    end
-    if n == 3 then
-      toggle_delay_output()
-    end
   end
 end
 
@@ -146,11 +310,10 @@ function add_parameters()
   params:set_action('input_passthrough_onoff', function(value)
     if value == 1 then
       inpass = false
-      params:set('monitor_level', -inf)
     else
       inpass = true
-      params:set('monitor_level', remember)
     end
+    refresh_monitor_routing()
   end)
   params:add_option('delay_input_onoff', 'delay input', onoff, 2)
   params:set_action('delay_input_onoff', function(value)
@@ -173,8 +336,12 @@ function add_parameters()
   params:add_group('delay levels', 5)
   params:add_control('input_passthrough', 'input passthru level', controlspec.DB)
   params:set_action('input_passthrough', function(value)
-    params:set('monitor_level', value)
     remember = value
+    if not speaker_scan_active and inpass then
+      params:set('monitor_level', value)
+    else
+      refresh_monitor_routing()
+    end
   end)
   params:set('input_passthrough', 0)
   params:add_control('delay_input', 'delay input level', controlspec.AMP)
@@ -194,6 +361,9 @@ function add_parameters()
   params:set_action('outputs', function(value)
     osc.send({'localhost', 57120}, '/receiver', {22, value})
   end)
+  params:add_group('speaker scan', 2)
+  params:add_control('speaker_scan_rate', 'speaker scan rate', controlspec.new(50, 2000, 'lin', 50, 250, 'ms'))
+  params:add_option('speaker_scan_type', 'speaker scan type', {'random', 'circular', 'ping-pong', 'shuffle', 'drunk'}, 1)
   params:add_group('feedback', 6)
   params:add_control('fb_level', 'feedback level', controlspec.AMP)
   params:set_action('fb_level', function(value)
@@ -229,6 +399,8 @@ function add_parameters()
   params:set('fx_probability', 50)
   params:set('grain_decay_time', 120)
   params:set('outputs', 1)
+  params:set('speaker_scan_rate', 250)
+  params:set('speaker_scan_type', 1)
 
   -- effect range configuration
   -- group them together for clarity
@@ -310,6 +482,10 @@ function redraw()
     screen.text('clearing')
     screen.move(75, 63)
     screen.text(math.ceil(math.max(0, purge_end_time - util.time())) .. 's')
+  elseif speaker_scan_active then
+    screen.text('scan ' .. params:string('speaker_scan_type'))
+    screen.move(100, 63)
+    screen.text(current_scan_speaker)
   elseif purge_notice_until ~= nil and util.time() < purge_notice_until then
     screen.text('buffer ready')
   else
@@ -321,5 +497,6 @@ function redraw()
 end
 
 function cleanup()
+  stop_speaker_scan()
   params:set('monitor_level', pre_init_monitor_level)
 end

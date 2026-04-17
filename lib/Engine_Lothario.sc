@@ -3,7 +3,7 @@ Engine_Lothario : CroneEngine {
     var micGrp, ptrGrp, recGrp, granGrp;
     var panLFOs, cutoffLFOs, resonanceLFOs;
     var rates, durs, delays;
-    var a, g, h, i, fb;
+    var a, g, h, i, fb, m;
     var fxProb;
     var pitchMin, pitchMax;
     var ringMin, ringMax;
@@ -14,6 +14,7 @@ Engine_Lothario : CroneEngine {
     var flushRoutine;
     var flushActive;
     var outputMode;
+    var scanActive, scanSpeaker, monitorScanAmp;
 
     *new { arg context, doneCallback;
         ^super.new(context, doneCallback);
@@ -65,6 +66,20 @@ Engine_Lothario : CroneEngine {
             Out.ar(out, ((stereo[0] + stereo[1]) * 0.5) * amp);
         }).add;
 
+        SynthDef(\monitorScan, {
+            arg in = 0, out = 0, amp = 0, scanActive = 0, scanSpeaker = 1;
+            var sig, mask;
+            sig = In.ar(in, 1) * amp * Lag.kr(scanActive, 0.02);
+            mask = Select.kr((scanSpeaker - 1).clip(0, 3), [
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ]);
+            mask = Lag.kr(mask, 0.005);
+            Out.ar(out, sig * mask);
+        }).add;
+
         SynthDef(\gran, {
             arg amp = 0.5, buf = 0, out = 0,
                 atk = 1, rel = 1, gate = 1,
@@ -82,6 +97,7 @@ Engine_Lothario : CroneEngine {
                 bitMin = 4.0, bitMax = 16.0,
                 grainDecayTime = 120,
                 outputMode = 1,
+                scanActive = 0, scanSpeaker = 1,
                 fadeLevel = 1, fadeLag = 0.05;
 
             var env, densCtrl, durCtrl, rateCtrl, panCtrl;
@@ -93,8 +109,9 @@ Engine_Lothario : CroneEngine {
             var pitchRatio, ringFreq, sampleRateRed, bitDepth;
             var pitched, ringed, sampleReduced, bitReduced, fxSig;
             var ampSig;
-            var monoSig, chanIdx, baseMask, outputMask, mask, outSig;
+            var monoSig, chanIdx, baseMask, outputMask, scanMask, mask, outSig;
             var sourceAge, ageFade, fadeMul;
+            var scanMix;
 
             env = EnvGen.kr(Env.asr(atk, 1, rel), gate, doneAction: 2);
 
@@ -161,7 +178,14 @@ Engine_Lothario : CroneEngine {
                 [1, 1, 0, 0],
                 [0, 0, 1, 1]
             ]);
-            mask = baseMask * outputMask;
+            scanMask = Select.kr((scanSpeaker - 1).clip(0, 3), [
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ]);
+            scanMix = Lag.kr(scanActive, 0.01);
+            mask = ((baseMask * outputMask) * (1 - scanMix)) + (scanMask * scanMix);
             mask = Lag.kr(mask, 0.005);
 
             outSig = monoSig * mask;
@@ -179,6 +203,7 @@ Engine_Lothario : CroneEngine {
         h = Synth(\ptr, [\buf, b, \out, ptrBus], ptrGrp);
         i = Synth(\rec, [\ptrIn, ptrBus, \micIn, micBus, \buf, b], recGrp);
         fb = Synth(\fbPatchMix, [\in, 0, \out, micBus], micGrp, addAction: \addToHead);
+        m = Synth(\monitorScan, [\in, micBus, \out, 0, \amp, 0, \scanActive, 0, \scanSpeaker, 1], micGrp);
 
         panLFOs = Array.fill(16, { 0 });
         cutoffLFOs = Array.fill(16, { 0 });
@@ -206,6 +231,9 @@ Engine_Lothario : CroneEngine {
         flushRoutine = nil;
         flushActive = false;
         outputMode = 1;
+        scanActive = 0;
+        scanSpeaker = 1;
+        monitorScanAmp = 0;
 
         g = 16.collect({ arg n;
             Synth(\gran, [
@@ -237,6 +265,8 @@ Engine_Lothario : CroneEngine {
                 \bitMin, bitMin, \bitMax, bitMax,
                 \grainDecayTime, grainDecayTime,
                 \outputMode, outputMode,
+                \scanActive, scanActive,
+                \scanSpeaker, scanSpeaker,
                 \fadeLevel, 1,
                 \fadeLag, 0.05
             ], granGrp);
@@ -337,6 +367,23 @@ Engine_Lothario : CroneEngine {
                 if(msg[1] == 22, {
                     outputMode = msg[2];
                     16.do({ arg j; g[j].set(\outputMode, outputMode); });
+                });
+
+                if(msg[1] == 23, {
+                    scanActive = msg[2];
+                    m.set(\scanActive, scanActive);
+                    16.do({ arg j; g[j].set(\scanActive, scanActive); });
+                });
+
+                if(msg[1] == 24, {
+                    scanSpeaker = msg[2];
+                    m.set(\scanSpeaker, scanSpeaker);
+                    16.do({ arg j; g[j].set(\scanSpeaker, scanSpeaker); });
+                });
+
+                if(msg[1] == 25, {
+                    monitorScanAmp = msg[2];
+                    m.set(\amp, monitorScanAmp);
                 });
             }, "/receiver");
         );
